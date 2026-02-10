@@ -2,7 +2,7 @@
 
 **Crypto Sentinel**, modern yazılım mimarisiyle geliştirilmiş, hibrit (REST + WebSocket) yapıda çalışan, gelişmiş bir **yapay zeka destekli kripto ticaret botudur.**
 
-Bu proje; anlık piyasa verilerini analiz eder, kendi geliştirdiği "Sentinel Score" algoritması ile fırsatları belirler ve Binance üzerinde otomatik al-sat işlemleri yapar. Aynı zamanda "Circuit Breaker" (Akıllı Şalter) ve "Moonbag" gibi risk yönetimi stratejileriyle sermayenizi korur.
+Bu proje; anlık piyasa verilerini analiz eder, kendi geliştirdiği "Sentinel Score" algoritması ile fırsatları belirler ve Binance üzerinde (proje kapsamında simülasyon olarak) otomatik al-sat işlemleri yapar. Tüm bu süreçte sizi **anlık Telegram bildirimleri** ile haberdar ederken, işlemlerinizi ve performans verilerinizi **güvenli bir veritabanında** saklar. Aynı zamanda "Circuit Breaker" (Akıllı Şalter) ve "Moonbag" gibi risk yönetimi stratejileriyle sermayenizi korur.
 
 ---
 

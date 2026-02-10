@@ -202,7 +202,7 @@ class StreamManager:
                     exit_price=current_price,
                     pnl_sign="+",
                     pnl=current_roe * 100
-                ) + f"\n💵 Kar: {realized_pnl_tp1:.2f} $\n📉 Kalan: {remaining_size:.2f} $\nℹ️ {info_msg}"
+                ) + f"\n💵 Kar: {realized_pnl_tp1:.2f} $\n📉 Kalan: {remaining_size:.2f} $\nℹ️ {info_msg}\n🎯 Sıradaki Hedef: {tp_price_db:.2f}"
                 self.bot.send_message(msg)
                 return
 
@@ -320,7 +320,7 @@ class StreamManager:
                     exit_price=current_price,
                     pnl_sign="+",
                     pnl=current_roe * 100
-                ) + f"\n🚀 Ana Kar Alındı: +{realized_pnl:.2f} $\n👻 Moonbag (Ghost Runner): {moonbag_size}$ Bırakıldı\n🎯 Yeni Hedef: 200% ROE"
+                ) + f"\n🚀 Ana Kar Alındı: +{realized_pnl:.2f} $\n👻 Moonbag (Ghost Runner): {moonbag_size}$ Bırakıldı\n🎯 Yeni Hedef: 200% ROE ({new_tp_price:.2f})"
                 self.bot.send_message(msg)
                 return
 

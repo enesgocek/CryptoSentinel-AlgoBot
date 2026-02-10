@@ -22,7 +22,22 @@ Bot, sadece tek bir indikatöre bakmaz. RSI, MACD, Bollinger Bantları, OBV (Hac
 *   **Phoenix Modu:** Eğer sanal bakiye tükenirse (örn: <10$), sistem otomatik olarak kasayı sıfırlar ve simülasyona devam etmenizi sağlar.
 *   **Moonbag Stratejisi:** Yüksek riskli işlemlerde ana para erkenden çekilir, içeride sadece "kar" bırakılır (Free Ride) ve fiyatın "aya gitmesi" (Moon) beklenir.
 
+### 📚 Kripto Sözlüğü ve Bot Mantığı (Nedir, Nasıl Çalışır?)
+
+Bu botu kullanırken karşılaşacağınız terimlerin en basit haliyle açıklamaları:
+
+*   **RSI (Hız Göstergesi):** "Fiyat çok mu şişti yoksa çok mu düştü?" sorusunun cevabıdır.
+    *   *Örnek:* RSI 70 üzerine çıkarsa fiyat "pahalı" kabul edilir ve satış sinyali aranır.
+*   **MACD (Trend Dedektifi):** Fiyatın yönü yukarı mı aşağı mı? Trendin gücünü ve dönüş sinyallerini yakalar.
+*   **Bollinger Bantları (Volatilite):** Fiyatın ne kadar sakin veya hırçın olduğunu ölçer.
+    *   *Sıkışma (Squeeze):* Fırtına öncesi sessizliktir. Büyük bir hareketin (patlamanın) habercisidir.
+*   **Pivot Noktaları (Görünmez Duvarlar):** Fiyatın çarpıp dönebileceği matematiksel destek ve direnç seviyeleridir. Bot bu seviyelerde kar almayı sever.
+*   **ROE (Ana Para Getirisi):** Toplam işlem büyüklüğüne değil, sadece **cebinizden koyduğunuz paraya** (Marjin) göre kar oranınızdır.
+*   **Moonbag (Bedava Bilet):** İşlem hedefe ulaştığında ana paranızı ve biraz karı cebinize koyup, kalan küçük bir miktarı "Ay'a giderse zengin olurum" diyerek içeride bırakma stratejisidir.
+*   **Circuit Breaker (Sigorta):** Evdeki sigorta gibidir. Eğer o gün çok zarar ederseniz, bot "Bugün şansımız yok" diyerek kendine 8 saatlik bir mola verir. Sizi hırsa kapılıp hata yapmaktan korur.
+
 ---
+
 
 ## 🛠️ Kurulum
 

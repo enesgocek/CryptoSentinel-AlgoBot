@@ -5,3 +5,5 @@ requests
 websocket-client
 ccxt
 python-dotenv
+numpy
+

@@ -67,14 +67,15 @@ Bu botu kullanırken karşılaşacağınız terimlerin en basit haliyle açıkla
     pip install -r requirements.txt
     ```
 
-4.  **Ayarları Yapılandırın:**
-    *   `.env.example` dosyasının adını `.env` olarak değiştirin.
+4.  **Ayarları Yapılandırın (.env Dosyası):**
+    *   Proje ana dizinindeki `.env.example` dosyasını kopyalayıp adını `.env` olarak değiştirin.
     *   İçerisine kendi API anahtarlarınızı ve veritabanı bağlantı linkini ekleyin.
+    *   *Not:* Telegram ayarları için Telegram'da **@BotFather** üzerinden yeni bir bot oluşturup Token ve Chat ID'nizi almanız gerekmektedir.
 
     ```ini
-    TELEGRAM_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+    TELEGRAM_TOKEN=123456:ABC-DEF... (BotFather'dan alınan token)
     TELEGRAM_CHAT_ID=123456789
-    DB_CONNECTION_STRING=postgresql://kullanici:sifre@host:port/veritabani
+    DB_CONNECTION_STRING=postgresql://...
     ```
 
 ---

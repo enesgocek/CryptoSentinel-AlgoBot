@@ -146,18 +146,21 @@ class StreamManager:
                 should_take_tp1 = True
                 
             # B. PIVOT TP KONTROLÜ (Pivot Seviyesi + Min %15 Kar)
-            pivot_trigger = False
+            pivot_level_hit = False
             is_pivot_filled = trade.get('is_pivot_tp_filled', False)
             
             if not is_pivot_filled:
                 pivots = self.db.get_latest_pivots(trade['symbol'])
                 if pivots and current_roe > 0.15: 
+                    # STRICT COMPARISON (No more demo logic)
                     if position == 'LONG':
+                        # Fiyat R1, R2 veya R3'e değdi mi?
                         if (current_price >= pivots['R1']) or (current_price >= pivots['R2']) or (current_price >= pivots['R3']):
-                            pivot_trigger = True
+                            pivot_level_hit = True
                     elif position == 'SHORT':
+                        # Fiyat S1, S2 veya S3'e değdi mi?
                         if (current_price <= pivots['S1']) or (current_price <= pivots['S2']) or (current_price <= pivots['S3']):
-                            pivot_trigger = True
+                            pivot_level_hit = True
 
             # --- EYLEM ZAMANI ---
             
@@ -215,13 +218,10 @@ class StreamManager:
             if is_pivot_tp_filled in [1, '1', True, 'true', 'True']: is_pivot_tp_filled = True
             else: is_pivot_tp_filled = False
 
-            if not is_pivot_tp_filled and current_roe > 0.15:
-                # Pivot Seviyeleri (Öncelik Sırası: R2 > R1 > P)
-                # ...
-                # (Pivot verisi memory_cache'den veya DB'den alınabilir, şimdilik basit mantık)
-                pivot_level_hit = True # Demo: %15 ROE yetti.
+            if not is_pivot_tp_filled and pivot_level_hit:
+                # Pivot trigger is now calculated above and stored in pivot_level_hit
                 
-                if pivot_level_hit:
+                if True: # Logic flow continuation
                     # MEDIUM RISK STRATEJİSİ: %40 KAPAT, STOP -> ENTRY
                     if is_medium_risk:
                         close_ratio = 0.40 # %40

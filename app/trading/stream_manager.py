@@ -175,7 +175,7 @@ class StreamManager:
                      if is_pivot_filled: close_ratio_current = 0.666 # Bu logic karmaşıklaşabilir, basitleştirelim:
                      else: close_ratio_current = 0.50
                 elif is_medium_risk:
-                     close_ratio_current = 0.80 # %80'ini sat, %20 içeride kalsın
+                     close_ratio_current = 0.40 # %40'ını sat, %60 içeride kalsın
                 
                 closed_amount = current_size * close_ratio_current
                 realized_pnl_tp1 = closed_amount * current_roe
@@ -194,8 +194,8 @@ class StreamManager:
                 
                 
                 # Mesaj
-                runner_pct = 20 if is_medium_risk else 50
-                info_msg = f"🛡️ Medium Risk TP1: %80 Kar Cepte, %20 Runner." if is_medium_risk else f"🚀 High Risk TP1: %50 Kar Cepte, %50 Runner."
+                runner_pct = 60 if is_medium_risk else 50
+                info_msg = f"🛡️ Medium Risk TP1: %40 Kar Cepte, %60 Runner." if is_medium_risk else f"🚀 High Risk TP1: %50 Kar Cepte, %50 Runner."
                 
                 msg = msg_template.format(
                     title="💰 TP1 ALINDI (ROE %25) 🛡️",

@@ -77,12 +77,12 @@ class StreamManager:
         )
 
         # --- CÜZDAN & PNL HESAPLAMASI ---
-        position_size = float(trade.get('position_size', 0))
-        # İşlem büyüklüğü yoksa PnL hesaplanmaz.
+        # NON-DESTRUCTIVE: 'current_size' kullanılır. Yoksa 'position_size' (Initial) fallback.
+        current_size = float(trade.get('current_size', trade.get('position_size', 0)))
         
         realized_pnl = 0.0
-        if position_size > 0:
-            realized_pnl = position_size * current_roe
+        if current_size > 0:
+            realized_pnl = current_size * current_roe
 
         # 1. LİKİDASYON KONTROLÜ
         is_liquidated = (position == 'LONG' and current_price <= liq_price) or \
@@ -91,11 +91,12 @@ class StreamManager:
         if is_liquidated:
             print(f"💀 LİKİDASYON: {trade['symbol']}")
             
-            # Likidasyon durumunda parayı kaybet
-            loss_amount = -position_size
+            # Likidasyon durumunda parayı kaybet (Aktif büyüklük kadar)
+            loss_amount = -current_size 
             new_balance = self.db.update_balance(loss_amount)
             
-            self.db.close_trade(trade_id, current_price, -100.0, 'LIQUIDATED', "Liq Fiyatına Değdi")
+            # exit_size = 0 (Her şey gitti)
+            self.db.close_trade(trade_id, current_price, -100.0, 'LIQUIDATED', "Liq Fiyatına Değdi", exit_size=0)
             
             msg = msg_template.format(
                 title="💀 POZİSYON LİKİT OLDU (REKT) 💀",
@@ -114,15 +115,11 @@ class StreamManager:
         threshold_medium = config.RISK_VARS.get('MEDIUM', 50)
         
         # Orjinal büyüklüğü tahmin et
-        estimated_original_size = position_size
-        if is_tp1_filled: estimated_original_size /= 0.50
-        if trade.get('is_pivot_tp_filled', False): 
-             # Pivot payı high risk için %25, medium için %50 varsayalım (aşağıdaki mantıkla uyumlu)
-             # Ancak tersine mühendislik zor, kabaca tahmin edelim:
-             estimated_original_size /= 0.75 
+        # Orjinal büyüklüğü tahmin et (ARTIK GEREK YOK - position_size zaten Initial)
+        initial_size = float(trade.get('position_size', 0))
         
-        is_high_risk = estimated_original_size >= threshold_high
-        is_medium_risk = threshold_medium <= estimated_original_size < threshold_high
+        is_high_risk = initial_size >= threshold_high
+        is_medium_risk = threshold_medium <= initial_size < threshold_high
         
         if is_high_risk or is_medium_risk:
             
@@ -173,22 +170,23 @@ class StreamManager:
                 close_ratio_current = 0.50
                 
                 if is_high_risk:
-                     # Eğer Pivot daha önce alındıysa (%75 kaldı): %50 almak için -> %66.6 kapat.
-                     if is_pivot_filled: close_ratio_current = 0.666
+                     # Eğer Pivot daha önce alındıysa şu anki'nin değil, INITIAL'ın oranını kullanmak daha doğru
+                     # Ama basitlik için current üzerinden gidelim.
+                     if is_pivot_filled: close_ratio_current = 0.666 # Bu logic karmaşıklaşabilir, basitleştirelim:
                      else: close_ratio_current = 0.50
                 elif is_medium_risk:
                      close_ratio_current = 0.80 # %80'ini sat, %20 içeride kalsın
                 
-                closed_amount = position_size * close_ratio_current
+                closed_amount = current_size * close_ratio_current
                 realized_pnl_tp1 = closed_amount * current_roe
                 new_balance = self.db.update_balance(realized_pnl_tp1)
                 
                 # Stop Güncelle (Breakeven)
                 new_sl_price = entry_price * 1.001 if position == 'LONG' else entry_price * 0.999
-                remaining_size = position_size - closed_amount
+                remaining_size = current_size - closed_amount
                 
                 if remaining_size < 1: # Çok az kaldıysa veya bittiyse kapat
-                     self.db.close_trade(trade_id, current_price, current_roe*100, 'CLOSED', "TP1 + Pivot Tümü (Macro TP)")
+                     self.db.close_trade(trade_id, current_price, current_roe*100, 'CLOSED', "TP1 + Pivot Tümü (Macro TP)", exit_size=0)
                 else:
                      self.db.update_trade_after_tp1(trade_id, remaining_size, new_sl_price)
                 
@@ -225,8 +223,8 @@ class StreamManager:
                     # MEDIUM RISK STRATEJİSİ: %40 KAPAT, STOP -> ENTRY
                     if is_medium_risk:
                         close_ratio = 0.40 # %40
-                        profit_size = position_size * close_ratio
-                        remaining_size = position_size - profit_size
+                        profit_size = current_size * close_ratio
+                        remaining_size = current_size - profit_size
                         
                         realized_pnl_pivot = profit_size * current_roe
                         new_balance = self.db.update_balance(realized_pnl_pivot)
@@ -274,8 +272,9 @@ class StreamManager:
             # Eğer işlem zaten MOONBAG modundaysa, bu ikinci TP (200%) demektir -> Kapat.
             if trade.get('status') == 'MOONBAG':
                  print(f"🌕 MOONBAG HEDEFİ VURULDU! (200% ROE) - {trade['symbol']}")
-                 new_balance = self.db.update_balance(position_size * current_roe)
-                 self.db.close_trade(trade_id, current_price, current_roe*100, 'CLOSED', "MOONBAG 200% TP", is_moonbag=True)
+                 new_balance = self.db.update_balance(current_size * current_roe)
+                 # Exit Size = Moonbag'in kendisi
+                 self.db.close_trade(trade_id, current_price, current_roe*100, 'MOONBAG_CLOSED', "MOONBAG 200% TP", is_moonbag=True, exit_size=current_size)
                  
                  msg = msg_template.format(
                     title="🌕 MOONBAG HEDEFİ (200%) 🚀",
@@ -297,7 +296,7 @@ class StreamManager:
                 
                 # Hedef: 10$ Bırak, Gerisini Sat.
                 moonbag_size = 10.0
-                profit_taken_size = position_size - moonbag_size
+                profit_taken_size = current_size - moonbag_size
                 
                 # Kar Hesapla
                 realized_pnl_main = profit_taken_size * current_roe
@@ -333,7 +332,8 @@ class StreamManager:
                 
                 # Main TP Flag'ini Set Et (Db update)
                 new_balance = self.db.update_balance(realized_pnl)
-                self.db.close_trade(trade_id, current_price, current_roe*100, 'CLOSED', "Main TP Hedefi", is_main_tp=True)
+                # Tam kapanışta exit_size = current_size (hepsi satıldı)
+                self.db.close_trade(trade_id, current_price, current_roe*100, 'CLOSED', "Main TP Hedefi", is_main_tp=True, exit_size=current_size)
                 
                 msg = msg_template.format(
                     title=title_msg,
@@ -353,7 +353,10 @@ class StreamManager:
             new_balance = self.db.update_balance(realized_pnl)
             
             print(f"⚡ STOP OLDU: {trade['symbol']} (Fiyat: {current_price}, Zarar: {realized_pnl:.2f}$)")
-            self.db.close_trade(trade_id, current_price, current_roe*100, 'CLOSED', "SL Hedefi (Fiyat)")
+            
+            # Stop olduğunda exit_size = current_size (hepsi satıldı)
+            final_status = 'MOONBAG_CLOSED' if trade.get('status') == 'MOONBAG' else 'CLOSED'
+            self.db.close_trade(trade_id, current_price, current_roe*100, final_status, "SL Hedefi (Fiyat)", exit_size=current_size)
 
             msg = msg_template.format(
                 title="⚠️ STOP OLDU (STOP LOSS) 🛑",

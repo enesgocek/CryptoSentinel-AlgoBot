@@ -312,8 +312,8 @@ class DatabaseManager:
     def open_trade(self, symbol: str, position: str, price: float, liq_price: float, tp_price: float, sl_price: float, position_size: float, timeframe: str = '1h') -> bool:
         """Yeni işlem açar. Başarılıysa True döner."""
         query = text("""
-            INSERT INTO trade_history (symbol, position, entry_price, entry_time, status, leverage, liquidation_price, tp_price, sl_price, position_size, timeframe)
-            VALUES (:symbol, :position, :price, :time, 'OPEN', :leverage, :liq_price, :tp_price, :sl_price, :position_size, :timeframe)
+            INSERT INTO trade_history (symbol, position, entry_price, entry_time, status, leverage, liquidation_price, tp_price, sl_price, position_size, current_size, timeframe)
+            VALUES (:symbol, :position, :price, :time, 'OPEN', :leverage, :liq_price, :tp_price, :sl_price, :position_size, :position_size, :timeframe)
         """)
         
         params = {
@@ -325,7 +325,7 @@ class DatabaseManager:
             'liq_price': float(liq_price),
             'tp_price': float(tp_price),
             'sl_price': float(sl_price),
-            'position_size': float(position_size),
+            'position_size': float(position_size), # INITIAL SIZE
             'timeframe': str(timeframe)
         }
 
@@ -342,22 +342,23 @@ class DatabaseManager:
             print(f"❌ İşlem açma hatası: {e}")
             return False
 
-    def close_trade(self, trade_id, exit_price, pnl, status, notes="", is_main_tp=False, is_moonbag=False):
+    def close_trade(self, trade_id, exit_price, pnl, status, notes="", is_main_tp=False, is_moonbag=False, exit_size=0):
         """Açık bir işlemi kapatır ve günceller."""
-        # DÜZELTME: entry_time yerine exit_time güncelleniyor
         
-        # Dinamik SQL oluştur (Flagleri sadece True ise güncellemek daha güvenli ama burada direkt set edebiliriz)
-        # Basitlik için her zaman set edelim, varsayılanlar zaten False DB'de. 
-        # Ama var olan değeri bozmamak lazım.
-        # Bu yüzden SQL'i dinamik yapalım veya COALESCE kullanalım? 
-        # En temizi: Parametre olarak geçilen True değerlerini set etmek.
-        
+        # STATUS LOGIC (MOONBAG -> MOONBAG_CLOSED)
+        # Bu logic'i SQL tarafında yapmak daha güvenli ama burada da basitçe halledebiliriz.
+        # Eğer dışarıdan direk 'MOONBAG_CLOSED' gelmediyse ve trade zaten MOONBAG modundaysa...
+        # Ancak buraya status parametresi geliyor. Çaıran yer (stream_manager) doğru statusü göndermeli.
+        # Biz yine de exit_size'ı güncelleyelim.
+
         update_parts = [
             "exit_price = :exit_price",
             "exit_time = :exit_time",
             "pnl = :pnl",
             "status = :status",
-            "notes = :notes"
+            "notes = :notes",
+            "exit_size = :exit_size",
+            "current_size = 0" # Kapanınca aktif size 0 olur
         ]
         
         params = {
@@ -366,6 +367,7 @@ class DatabaseManager:
             'pnl': float(pnl),
             'status': status,
             'notes': notes,
+            'exit_size': float(exit_size),
             'trade_id': int(trade_id)
         }
         
@@ -392,13 +394,12 @@ class DatabaseManager:
     def update_trade_after_tp1(self, trade_id, new_size, new_sl_price):
         """
         TP1 (Kısmi Kar Al) sonrası işlemi günceller:
-        1. Pozisyon büyüklüğünü yarıya indirir.
-        2. Stop Loss'u giriş seviyesine çeker.
-        3. is_tp1_filled bayrağını True yapar.
+        1. current_size (Aktif Büyüklük) güncellenir. (position_size SABİT KALIR)
+        2. Stop Loss güncellenir.
         """
         query = text("""
             UPDATE trade_history
-            SET position_size = :new_size,
+            SET current_size = :new_size,
                 sl_price = :new_sl_price,
                 is_tp1_filled = TRUE,
                 notes = 'TP1 ALINDI - Risk Free Modu'
@@ -419,14 +420,11 @@ class DatabaseManager:
 
     def update_trade_after_pivot(self, trade_id, new_size, new_sl_price):
         """
-        Pivot TP (Çeyrek Kar Al) sonrası işlemi günceller:
-        1. Pozisyon büyüklüğü güncellenir.
-        2. Stop Loss giriş seviyesine çekilir.
-        3. is_pivot_tp_filled True yapılır.
+        Pivot TP -> current_size güncellenir.
         """
         query = text("""
             UPDATE trade_history
-            SET position_size = :new_size,
+            SET current_size = :new_size,
                 sl_price = :new_sl_price,
                 is_pivot_tp_filled = TRUE,
                 notes = 'PIVOT TP - Kademeli Kar Alım'
@@ -447,16 +445,12 @@ class DatabaseManager:
 
     def set_trade_to_moonbag(self, trade_id, new_size, new_tp, new_sl):
         """
-        İşlemi Moonbag moduna geçirir:
-        1. Status -> 'MOONBAG'
-        2. Size -> Küçültülmüş miktar (Runner)
-        3. TP -> 200% ROE Hedefi
-        4. SL -> Giriş Seviyesi
+        Moonbag Modu -> current_size güncellenir.
         """
         query = text("""
             UPDATE trade_history
             SET status = 'MOONBAG',
-                position_size = :new_size,
+                current_size = :new_size,
                 tp_price = :new_tp,
                 sl_price = :new_sl,
                 is_main_tp_filled = TRUE,  -- MOONBAG'e geçiş = MAIN TP VURULDU

@@ -41,5 +41,7 @@ scripts/archive/
 # Logs & Data
 logs/
 data/
+*.pbix
 *.log
+*.db
 

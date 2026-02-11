@@ -9,6 +9,7 @@ from app.core.database import DatabaseManager
 from app.services.binance_client import BinanceClient
 from app.services.telegram_bot import TelegramBot
 from app.analysis.analyzer import MarketAnalyzer
+from app.trading.stream_manager import StreamManager
 from app.services.reporting import DailyReporter
 import schedule
 

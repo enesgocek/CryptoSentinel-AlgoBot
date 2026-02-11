@@ -21,12 +21,12 @@ TARGET_ROE_SL = 0.30 # %30 Zarar Kes (ROE)
 # --- CIRCUIT BREAKER (AKILLI ŞALTER) ---
 # Günlük Kar/Zarar Hedefleri ve Soğuma Süresi
 DAILY_TARGET_PROFIT = 200.0   # Günlük 100$ Kar Hedefi (Dur)
-DAILY_MAX_LOSS = -75.0        # Günlük 50$ Zarar Limiti (Dur)
+DAILY_MAX_LOSS = -100.0        # Günlük 50$ Zarar Limiti (Dur)
 TRADING_COOLDOWN_HOURS = 8    # Limitler aşılırsa 8 saat bekle
 
 # Yüksek Güvenli İşlemler İçin Esnek Limitler
 EXTENDED_TARGET_PROFIT = 400.0 # Güçlü sinyalde hedefi 200$'a çıkar
-EXTENDED_MAX_LOSS = -150.0     # Güçlü sinyalde zarara 125$'a kadar tahammül et
+EXTENDED_MAX_LOSS = -175.0     # Güçlü sinyalde zarara 125$'a kadar tahammül et
 
 # === SANAL CÜZDAN & RİSK YÖNETİMİ ===
 INITIAL_CAPITAL = 1000.0 # Başlangıç Bakiyesi (USDT)

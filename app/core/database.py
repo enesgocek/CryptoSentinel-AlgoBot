@@ -495,6 +495,21 @@ class DatabaseManager:
             print(f"❌ PnL Hesaplama Hatası: {e}")
             return 0.0
 
+    def get_daily_trades(self, hours=24) -> pd.DataFrame:
+        """Son 24 saatte kapanmış işlemleri getirir (Raporlama için)."""
+        query = text(f"""
+            SELECT * FROM trade_history 
+            WHERE exit_time >= NOW() - INTERVAL '{hours} hours'
+            AND status IN ('CLOSED', 'LIQUIDATED', 'MOONBAG_CLOSED')
+            ORDER BY exit_time DESC
+        """)
+        try:
+            with self.engine.connect() as conn:
+                return pd.read_sql(query, conn)
+        except Exception as e:
+            print(f"❌ Günlük İşlem Hatası: {e}")
+            return pd.DataFrame()
+
     def get_last_trade_exit_time(self) -> Optional[datetime]:
         """
         En son kapatılan işlemin çıkış zamanını döner.

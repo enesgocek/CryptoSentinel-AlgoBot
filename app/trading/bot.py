@@ -290,8 +290,8 @@ class CryptoSentinelBot:
                     print("-" * 30)
                     time.sleep(1) 
 
-                print("⏳ Analiz turu bitti. 30 sn bekleme...")
-                time.sleep(30) 
+                print("⏳ Analiz turu bitti. 10 sn bekleme...")
+                time.sleep(10) 
                 
         except KeyboardInterrupt:
             print("\n🛑 Döngü kırıldı.")

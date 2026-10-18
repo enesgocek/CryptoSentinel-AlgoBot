@@ -1,9 +1,5 @@
-pandas
-sqlalchemy
-psycopg2-binary
-requests
-websocket-client
-ccxt
-python-dotenv
-numpy
-schedule
+-c requirements-lock.txt
+pandas==3.0.6
+numpy==2.5.4
+aiohttp==3.14.5
+python-dotenv==1.2.4

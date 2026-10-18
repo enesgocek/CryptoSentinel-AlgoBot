@@ -1,579 +1,218 @@
-import pandas as pd
-from typing import Optional, List, Dict
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
-from datetime import datetime
+"""SQLite paper ledger: decimal strings and atomic, idempotent fills.
 
-from app.core import config 
+No legacy PostgreSQL table is opened or migrated by this module.
+"""
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+import sqlite3
+import threading
+
+from app.core.models import Fill, TradePlan, ZERO, decimal, utc_now
+
 
 class DatabaseManager:
-    def __init__(self):
-        """Veritabanı bağlantı motorunu hazırlar."""
-        print("🔌 Cloud Veritabanına bağlanılıyor...")
-        
-        # Cloud bağlantısı
+    def __init__(self, path=':memory:', initial_capital=Decimal('1000'), mode='paper'):
+        self.path = str(path)
+        if self.path != ':memory:':
+            Path(self.path).resolve().parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False, isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA foreign_keys=ON')
+        self.conn.execute('PRAGMA journal_mode=WAL')
         try:
-            self.engine = create_engine(config.DB_CONNECTION_STRING)
-            print("✅ Bağlantı Başarılı!")
-            
-            # Başlangıçta tabloları kontrol et
-            self.initialize_db()
-            
-        except Exception as e:
-            print(f"❌ Bağlantı Hatası: {e}")
+            self._initialize(decimal(initial_capital), mode)
+        except BaseException:
+            self.conn.close()
+            raise
 
-    def initialize_db(self):
-        """Gerekli tabloları eksiksiz oluşturur."""
-        print("🛠️ Veritabanı tabloları kontrol ediliyor...")
-
-        # 1. MARKET VERİSİ TABLOSU
-        create_market_table = text("""
-            CREATE TABLE IF NOT EXISTS market_data (
-                timestamp TIMESTAMP,
-                symbol TEXT,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
-                sentinel_score REAL,
-                vol_z_score REAL,
-                ema_50 REAL,
-                ema_200 REAL,
-                rsi REAL,
-                atr REAL,
-                bbw REAL,
-                adx REAL,
-                macd_line REAL,   -- Yeni: MACD
-                macd_signal REAL, -- Yeni: Sinyal
-                macd_hist REAL,   -- Yeni: Histogram
-                obv REAL,         -- Yeni: On-Balance Volume
-                is_support REAL,
-                pivot_p REAL,     -- Yeni: Pivot Point
-                pivot_r1 REAL,    -- Yeni: Res 1
-                pivot_r2 REAL,    -- Yeni: Res 2
-                pivot_r3 REAL,    -- Yeni: Res 3
-                pivot_s1 REAL,    -- Yeni: Sup 1
-                pivot_s2 REAL,    -- Yeni: Sup 2
-                pivot_s3 REAL     -- Yeni: Sup 3
-            );
-        """)
-
-        # 2. İŞLEM GEÇMİŞİ TABLOSU
-        create_trade_table = text("""
-            CREATE TABLE IF NOT EXISTS trade_history (
-                id SERIAL PRIMARY KEY,
-                symbol TEXT,
-                position TEXT,
-                entry_price REAL,
-                entry_time TIMESTAMP,
-                exit_price REAL,
-                exit_time TIMESTAMP,
-                pnl REAL,
-                status TEXT,
-                leverage INT,
-                liquidation_price REAL,
-                tp_price REAL,    -- Yeni: Hedef Fiyat
-                sl_price REAL,    -- Yeni: Stop Fiyatı
-                position_size REAL, -- Yeni: İşlem Büyüklüğü (USDT)
-                is_tp1_filled BOOLEAN DEFAULT FALSE, -- YENİ: TP1 (Kar Al 1) Gerçekleşti mi?
-                is_pivot_tp_filled BOOLEAN DEFAULT FALSE, -- YENİ: Pivot TP (Çeyrek Kar) Gerçekleşti mi?
-                is_main_tp_filled BOOLEAN DEFAULT FALSE,  -- YENİ: Ana Hedef (50% ROE) Gerçekleşti mi?
-                is_moonbag_filled BOOLEAN DEFAULT FALSE,  -- YENİ: Moonbag Hedef (200% ROE) Gerçekleşti mi?
-                timeframe TEXT,   -- YENİ: Zaman Dilimi ('1h', '15m' vb.)
-                notes TEXT
-            );
-        """)
-
-        # 3. CÜZDAN TABLOSU (SANAL BAKİYE) - GÜNCELLENDİ (reset_count eklendi)
-        create_wallet_table = text("""
-            CREATE TABLE IF NOT EXISTS wallet (
-                id SERIAL PRIMARY KEY,
-                balance REAL,
-                updated_at TIMESTAMP,
-                reset_count INTEGER DEFAULT 0 -- PHOENIX MODU: Kaç kere battık?
-            );
-        """)
-        
-        # 4. DUPLICATE TRADE ÖNLEME
-        # Aynı coin için birden fazla 'OPEN' işlemi olamaz.
-        create_unique_index = text("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_open_trades 
-            ON trade_history (symbol) 
-            WHERE status = 'OPEN';
-        """)
-
-        try:
-            with self.engine.connect() as conn:
-                conn.execute(create_market_table)
-                conn.execute(create_trade_table)
-                conn.execute(create_wallet_table)
-                conn.execute(create_unique_index)
-                
-                # --- MIGRATION: Eğer tablo varsa ama sütun yoksa ekle ---
-                try:
-                    conn.execute(text("ALTER TABLE wallet ADD COLUMN IF NOT EXISTS reset_count INTEGER DEFAULT 0;"))
-                except Exception:
-                    pass # Sütun zaten varsa devam et
-
-                conn.commit()
-            print("✅ Tablolar ve Kısıtlamalar Hazır (Otomatik Kurulum Tamam).")
-            
-            # --- MIGRATION: Pivot Kolonlarını Ekle (Eğer yoksa) ---
-            self._migrate_pivots()
-            self._migrate_pivot_tp_flag()
-            self._migrate_timeframe()
-            self._migrate_telemetry_flags() # YENİ
-
-        except Exception as e:
-            print(f"❌ Tablo Oluşturma Hatası: {e}")
-
-    def _migrate_pivots(self):
-        """Mevcut market_data tablosuna pivot kolonlarını ekler."""
-        pivot_cols = ['pivot_p', 'pivot_r1', 'pivot_r2', 'pivot_r3', 'pivot_s1', 'pivot_s2', 'pivot_s3']
-        with self.engine.connect() as conn:
-            for col in pivot_cols:
-                try:
-                    conn.execute(text(f"ALTER TABLE market_data ADD COLUMN IF NOT EXISTS {col} REAL;"))
-                except Exception:
-                    pass
-            conn.commit()
-
-    def _migrate_pivot_tp_flag(self):
-        """trade_history tablosuna is_pivot_tp_filled kolonunu ekler."""
-        with self.engine.connect() as conn:
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            self.conn.execute('BEGIN IMMEDIATE')
             try:
-                conn.execute(text("ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS is_pivot_tp_filled BOOLEAN DEFAULT FALSE;"))
-                conn.commit()
-            except Exception:
-                pass
+                yield self.conn
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
 
-    def _migrate_timeframe(self):
-        """trade_history tablosuna timeframe kolonunu ekler."""
-        with self.engine.connect() as conn:
-            try:
-                conn.execute(text("ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS timeframe TEXT;"))
-                conn.commit()
-            except Exception:
-                pass
+    def _initialize(self, initial, mode):
+        if initial <= ZERO:
+            raise ValueError('Initial capital must be positive.')
+        self.conn.executescript('''
+            CREATE TABLE IF NOT EXISTS paper_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS paper_account(id INTEGER PRIMARY KEY CHECK(id=1), cash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS paper_trades(
+                id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                entry_price TEXT NOT NULL, quantity TEXT NOT NULL, remaining TEXT NOT NULL,
+                initial_margin TEXT NOT NULL, margin TEXT NOT NULL, leverage INTEGER NOT NULL,
+                stop TEXT NOT NULL, target TEXT NOT NULL, initial_target TEXT NOT NULL,
+                pivot TEXT, tier TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN',
+                tp1 INTEGER NOT NULL DEFAULT 0, pivot_done INTEGER NOT NULL DEFAULT 0,
+                entry_time TEXT NOT NULL, exit_time TEXT, signal_candle TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS paper_one_active_symbol
+                ON paper_trades(symbol) WHERE status IN ('OPEN','MOONBAG');
+            CREATE TABLE IF NOT EXISTS paper_fills(
+                id INTEGER PRIMARY KEY, trade_id INTEGER NOT NULL REFERENCES paper_trades(id),
+                event_key TEXT UNIQUE NOT NULL, reason TEXT NOT NULL, price TEXT NOT NULL,
+                quantity TEXT NOT NULL, gross_pnl TEXT NOT NULL, fee TEXT NOT NULL,
+                net_pnl TEXT NOT NULL, timestamp TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS paper_signals(
+                symbol TEXT NOT NULL, candle TEXT NOT NULL, score INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL, PRIMARY KEY(symbol,candle));
+        ''')
+        with self.transaction() as c:
+            version = c.execute("SELECT value FROM paper_meta WHERE key='schema'").fetchone()
+            if version and version[0] != '1':
+                raise ValueError('Unsupported paper database version.')
+            saved_mode = c.execute("SELECT value FROM paper_meta WHERE key='mode'").fetchone()
+            if saved_mode and saved_mode[0] != mode:
+                raise ValueError(f'Database belongs to {saved_mode[0]}, not {mode}. Use a separate --db.')
+            c.execute("INSERT OR IGNORE INTO paper_meta VALUES('schema','1')")
+            c.execute("INSERT OR IGNORE INTO paper_meta VALUES('mode',?)", (mode,))
+            c.execute("INSERT OR IGNORE INTO paper_meta VALUES('initial_capital',?)", (str(initial),))
+            c.execute('INSERT OR IGNORE INTO paper_account VALUES(1,?)', (str(initial),))
 
-    def _migrate_telemetry_flags(self):
-        """trade_history tablosuna telemetry kolonlarını (Main TP vs Moonbag) ekler."""
-        with self.engine.connect() as conn:
-            # 1. Timeframe (Garanti olsun diye tekrar kontrol)
-            try:
-                conn.execute(text("ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS timeframe TEXT;"))
-                conn.commit()
-            except Exception:
-                pass
+    def _rows(self, query, params=()):
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(query, params).fetchall()]
 
-            # 2. is_main_tp_filled
-            try:
-                conn.execute(text("ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS is_main_tp_filled BOOLEAN DEFAULT FALSE;"))
-                conn.commit()
-            except Exception:
-                pass
+    @property
+    def initial_capital(self):
+        return decimal(self._rows("SELECT value FROM paper_meta WHERE key='initial_capital'")[0]['value'])
 
-            # 3. is_moonbag_filled
-            try:
-                conn.execute(text("ALTER TABLE trade_history ADD COLUMN IF NOT EXISTS is_moonbag_filled BOOLEAN DEFAULT FALSE;"))
-                conn.commit()
-            except Exception:
-                pass
+    def cash(self):
+        return decimal(self._rows('SELECT cash FROM paper_account WHERE id=1')[0]['cash'])
 
-    def save_to_db(self, df, table_name):
-        """DataFrame'i veritabanına yazar."""
-        try:
-            df.to_sql(table_name, self.engine, if_exists='append', index=False)
-            # print(f"💾 {len(df)} satır veri '{table_name}' tablosuna eklendi.")
-        except Exception as e:
-            print(f"❌ Veri Kayıt Hatası: {e}")
+    @staticmethod
+    def _add_cash(c, change):
+        current = decimal(c.execute('SELECT cash FROM paper_account WHERE id=1').fetchone()[0])
+        c.execute('UPDATE paper_account SET cash=? WHERE id=1', (str(current + change),))
 
-    # --- CÜZDAN YÖNETİMİ ---
+    def active_trades(self):
+        return self._rows("SELECT * FROM paper_trades WHERE status IN ('OPEN','MOONBAG') ORDER BY id")
 
-    def get_balance(self) -> float:
-        """Cüzdan bakiyesini getirir, yoksa oluşturur."""
-        query = text("SELECT balance FROM wallet ORDER BY id DESC LIMIT 1")
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query).fetchone()
-                
-                if result:
-                    return float(result[0])
-                else:
-                    # İlk kez çalışıyor, başlangıç bakiyesini ekle
-                    return self.update_balance(0, is_initial=True)
-        except Exception as e:
-            print(f"❌ Bakiye Hatası: {e}")
-            return 0.0
+    def trades(self):
+        return self._rows('SELECT * FROM paper_trades ORDER BY id')
 
-    def update_balance(self, amount_change: float, is_initial: bool = False) -> float:
-        """Bakiyeyi günceller (Kar/Zarar ekler)."""
-        try:
-            current_balance = config.INITIAL_CAPITAL if is_initial else self.get_balance()
-            new_balance = current_balance + amount_change
-            
-            # reset_count değerini korumak için son değeri alıyoruz
-            last_reset_count = 0
-            try:
-                with self.engine.connect() as conn:
-                    res = conn.execute(text("SELECT reset_count FROM wallet ORDER BY id DESC LIMIT 1")).fetchone()
-                    if res and res[0] is not None:
-                        last_reset_count = res[0]
-            except: pass
+    def fills(self):
+        return self._rows('SELECT * FROM paper_fills ORDER BY id')
 
-            query = text("""
-                INSERT INTO wallet (balance, updated_at, reset_count)
-                VALUES (:balance, :time, :reset_count)
-            """)
-            
-            with self.engine.connect() as conn:
-                conn.execute(query, {
-                    'balance': new_balance, 
-                    'time': datetime.now(),
-                    'reset_count': last_reset_count
-                })
-                conn.commit()
-            
-            if not is_initial:
-                # Loglama (Sadece değişim varsa)
-                if amount_change > 0: print(f"💰 Cüzdan Güncellendi: +{amount_change:.2f}$ (Yeni: {new_balance:.2f}$)")
-                elif amount_change < 0: print(f"💸 Cüzdan Güncellendi: {amount_change:.2f}$ (Yeni: {new_balance:.2f}$)")
-                
-            return new_balance
-        except Exception as e:
-            print(f"❌ Bakiye Güncelleme Hatası: {e}")
-            return 0.0
+    def consume_signal(self, symbol, candle, score, timestamp=None):
+        with self.transaction() as c:
+            cursor = c.execute('INSERT OR IGNORE INTO paper_signals VALUES(?,?,?,?)',
+                               (symbol, candle, int(score), timestamp or utc_now()))
+            return cursor.rowcount == 1
 
-    # --- PHOENIX MODU: YENİDEN DOĞUŞ ---
-    def check_and_reset_balance(self):
-        """
-        Bakiye 10$'ın altına düştüyse (Batış), kasayı sıfırlar ve sayacı artırır.
-        Return: (is_reset, new_balance, reset_count)
-        """
-        try:
-            with self.engine.connect() as conn:
-                # Son bakiye ve sayaç bilgisini al
-                cursor = conn.execute(text("SELECT balance, reset_count FROM wallet ORDER BY id DESC LIMIT 1"))
-                row = cursor.fetchone()
-                
-                if row:
-                    current_balance = float(row[0])
-                    # reset_count null gelirse 0 kabul et
-                    current_reset_count = int(row[1]) if row[1] is not None else 0
-                    
-                    # Eşik Değer: 10$ (İşlem açamayacak kadar az para)
-                    if current_balance < 10.0:
-                        new_reset_count = current_reset_count + 1
-                        
-                        # Yeni bakiyeyi (1000$) ve artan sayacı ekle
-                        insert_query = text("""
-                            INSERT INTO wallet (balance, updated_at, reset_count) 
-                            VALUES (:balance, :time, :reset_count)
-                        """)
-                        
-                        conn.execute(insert_query, {
-                            'balance': config.INITIAL_CAPITAL,
-                            'time': datetime.now(),
-                            'reset_count': new_reset_count
-                        })
-                        conn.commit()
-                        
-                        print(f"💀 KASA SIFIRLANDI! ({new_reset_count}. Kez Yeniden Doğuş)")
-                        return True, config.INITIAL_CAPITAL, new_reset_count
-                        
-            return False, 0, 0
-        except Exception as e:
-            print(f"❌ Phoenix Modu Hatası: {e}")
-            return False, 0, 0
-
-    # --- TRADER FONKSİYONLARI ---
-
-    def get_open_trades(self):
-        """Şu an AÇIK (OPEN) olan işlemleri getirir."""
-        query = text("SELECT * FROM trade_history WHERE status = 'OPEN'")
-        try:
-            with self.engine.connect() as conn:
-                df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            return pd.DataFrame() 
-
-    def get_monitored_trades(self):
-        """Websocket için izlenecek işlemleri (OPEN + MOONBAG) getirir."""
-        query = text("SELECT * FROM trade_history WHERE status IN ('OPEN', 'MOONBAG')")
-        try:
-            with self.engine.connect() as conn:
-                df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            return pd.DataFrame()
-
-    def open_trade(self, symbol: str, position: str, price: float, liq_price: float, tp_price: float, sl_price: float, position_size: float, timeframe: str = '1h') -> bool:
-        """Yeni işlem açar. Başarılıysa True döner."""
-        query = text("""
-            INSERT INTO trade_history (symbol, position, entry_price, entry_time, status, leverage, liquidation_price, tp_price, sl_price, position_size, current_size, timeframe)
-            VALUES (:symbol, :position, :price, :time, 'OPEN', :leverage, :liq_price, :tp_price, :sl_price, :position_size, :position_size, :timeframe)
-        """)
-        
-        params = {
-            'symbol': symbol,
-            'position': position,
-            'price': float(price),
-            'time': datetime.now(),
-            'leverage': int(config.LEVERAGE),
-            'liq_price': float(liq_price),
-            'tp_price': float(tp_price),
-            'sl_price': float(sl_price),
-            'position_size': float(position_size), # INITIAL SIZE
-            'timeframe': str(timeframe)
-        }
-
-        try:
-            with self.engine.connect() as conn:
-                conn.execute(query, params)
-                conn.commit() 
-            print(f"🚀 {symbol} için {position} işlemi açıldı! Büyüklük: {params['position_size']}$ | Giriş: {params['price']}$")
-            return True
-        except IntegrityError:
-            print(f"⚠️ {symbol} için zaten AÇIK bir işlem var! (DB Reddedildi)")
-            return False
-        except Exception as e:
-            print(f"❌ İşlem açma hatası: {e}")
-            return False
-
-    def close_trade(self, trade_id, exit_price, pnl, status, notes="", is_main_tp=False, is_moonbag=False, exit_size=0):
-        """Açık bir işlemi kapatır ve günceller."""
-        
-        # STATUS LOGIC (MOONBAG -> MOONBAG_CLOSED)
-        # Bu logic'i SQL tarafında yapmak daha güvenli ama burada da basitçe halledebiliriz.
-        # Eğer dışarıdan direk 'MOONBAG_CLOSED' gelmediyse ve trade zaten MOONBAG modundaysa...
-        # Ancak buraya status parametresi geliyor. Çaıran yer (stream_manager) doğru statusü göndermeli.
-        # Biz yine de exit_size'ı güncelleyelim.
-
-        update_parts = [
-            "exit_price = :exit_price",
-            "exit_time = :exit_time",
-            "pnl = :pnl",
-            "status = :status",
-            "notes = :notes",
-            "exit_size = :exit_size",
-            "current_size = 0" # Kapanınca aktif size 0 olur
-        ]
-        
-        params = {
-            'exit_price': float(exit_price),
-            'exit_time': datetime.now(),
-            'pnl': float(pnl),
-            'status': status,
-            'notes': notes,
-            'exit_size': float(exit_size),
-            'trade_id': int(trade_id)
-        }
-        
-        if is_main_tp:
-            update_parts.append("is_main_tp_filled = TRUE")
-            
-        if is_moonbag:
-            update_parts.append("is_moonbag_filled = TRUE")
-            
-        query = text(f"""
-            UPDATE trade_history
-            SET {', '.join(update_parts)}
-            WHERE id = :trade_id
-        """)
-
-        try:
-            with self.engine.connect() as conn:
-                conn.execute(query, params)
-                conn.commit()
-            print(f"🏁 İşlem Sonlandı (ID: {trade_id}) -> Durum: {status} | PNL: %{params['pnl']}")
-        except Exception as e:
-            print(f"❌ İşlem kapatma hatası: {e}")
-
-    def update_trade_after_tp1(self, trade_id, new_size, new_sl_price):
-        """
-        TP1 (Kısmi Kar Al) sonrası işlemi günceller:
-        1. current_size (Aktif Büyüklük) güncellenir. (position_size SABİT KALIR)
-        2. Stop Loss güncellenir.
-        """
-        query = text("""
-            UPDATE trade_history
-            SET current_size = :new_size,
-                sl_price = :new_sl_price,
-                is_tp1_filled = TRUE,
-                notes = 'TP1 ALINDI - Risk Free Modu'
-            WHERE id = :trade_id
-        """)
-        
-        try:
-            with self.engine.connect() as conn:
-                conn.execute(query, {
-                    'new_size': float(new_size),
-                    'new_sl_price': float(new_sl_price),
-                    'trade_id': int(trade_id)
-                })
-                conn.commit()
-            print(f"✨ TP1 GÜNCELLEMESİ BAŞARILI (Trade ID: {trade_id})")
-        except Exception as e:
-            print(f"❌ TP1 Güncelleme Hatası: {e}")
-
-    def update_trade_after_pivot(self, trade_id, new_size, new_sl_price):
-        """
-        Pivot TP -> current_size güncellenir.
-        """
-        query = text("""
-            UPDATE trade_history
-            SET current_size = :new_size,
-                sl_price = :new_sl_price,
-                is_pivot_tp_filled = TRUE,
-                notes = 'PIVOT TP - Kademeli Kar Alım'
-            WHERE id = :trade_id
-        """)
-        
-        try:
-            with self.engine.connect() as conn:
-                conn.execute(query, {
-                    'new_size': float(new_size),
-                    'new_sl_price': float(new_sl_price),
-                    'trade_id': int(trade_id)
-                })
-                conn.commit()
-            print(f"✨ PIVOT TP GÜNCELLEMESİ BAŞARILI (Trade ID: {trade_id})")
-        except Exception as e:
-            print(f"❌ Pivot TP Güncelleme Hatası: {e}")
-
-    def set_trade_to_moonbag(self, trade_id, new_size, new_tp, new_sl):
-        """
-        Moonbag Modu -> current_size güncellenir.
-        """
-        query = text("""
-            UPDATE trade_history
-            SET status = 'MOONBAG',
-                current_size = :new_size,
-                tp_price = :new_tp,
-                sl_price = :new_sl,
-                is_main_tp_filled = TRUE,  -- MOONBAG'e geçiş = MAIN TP VURULDU
-                notes = 'MOONBAG ACTIVATED - 200% Hedefi'
-            WHERE id = :trade_id
-        """)
-        
-        try:
-            with self.engine.connect() as conn:
-                conn.execute(query, {
-                    'new_size': float(new_size),
-                    'new_tp': float(new_tp),
-                    'new_sl': float(new_sl),
-                    'trade_id': int(trade_id)
-                })
-                conn.commit()
-            print(f"🌕 MOONBAG AKTİF (Trade ID: {trade_id}) -> Hedef: {new_tp}, Stop: {new_sl}")
-        except Exception as e:
-            print(f"❌ Moonbag Update Hatası: {e}")
-
-    # --- PERFORMANS ANALİZİ (CIRCUIT BREAKER) ---
-
-    def get_recent_pnl(self, hours=24) -> float:
-        """
-        Son N saat içinde kapatılan işlemlerden elde edilen 
-        TOPLAM GERÇEKLEŞMİŞ KAR/ZARAR (PnL) tutarını ($) döner.
-        """
-        query = text(f"""
-            SELECT SUM(pnl * position_size / 100.0) 
-            FROM trade_history 
-            WHERE status IN ('CLOSED', 'LIQUIDATED')
-            AND exit_time >= NOW() - INTERVAL '{hours} hours'
-        """)
-        # Not: PNL veritabanında % olarak tutuluyor (Örn: 50.0). 
-        # Tutar hesabı: (PNL / 100) * Position_Size
-        
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query).fetchone()
-                return float(result[0]) if result and result[0] is not None else 0.0
-        except Exception as e:
-            print(f"❌ PnL Hesaplama Hatası: {e}")
-            return 0.0
-
-    def get_daily_trades(self, hours=24) -> pd.DataFrame:
-        """Son 24 saatte kapanmış işlemleri getirir (Raporlama için)."""
-        query = text(f"""
-            SELECT * FROM trade_history 
-            WHERE exit_time >= NOW() - INTERVAL '{hours} hours'
-            AND status IN ('CLOSED', 'LIQUIDATED', 'MOONBAG_CLOSED')
-            ORDER BY exit_time DESC
-        """)
-        try:
-            with self.engine.connect() as conn:
-                return pd.read_sql(query, conn)
-        except Exception as e:
-            print(f"❌ Günlük İşlem Hatası: {e}")
-            return pd.DataFrame()
-
-    def get_last_trade_exit_time(self) -> Optional[datetime]:
-        """
-        En son kapatılan işlemin çıkış zamanını döner.
-        Wait/Cooldown hesabı için kullanılır.
-        """
-        query = text("""
-            SELECT exit_time FROM trade_history 
-            WHERE status IN ('CLOSED', 'LIQUIDATED') 
-            ORDER BY exit_time DESC LIMIT 1
-        """)
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query).fetchone()
-                return result[0] if result else None
-        except Exception as e:
-            print(f"❌ Son İşlem Zamanı Hatası: {e}")
-            return None
-
-    # --- MARKET VERİSİ ---
-    
-    def get_latest_pivots(self, symbol: str) -> Optional[Dict[str, float]]:
-        """
-        Coin için en son kaydedilen pivot seviyelerini getirir.
-        """
-        query = text("""
-            SELECT pivot_p, pivot_r1, pivot_r2, pivot_r3, pivot_s1, pivot_s2, pivot_s3
-            FROM market_data 
-            WHERE symbol = :symbol 
-            ORDER BY timestamp DESC LIMIT 1
-        """)
-        try:
-            with self.engine.connect() as conn:
-                row = conn.execute(query, {'symbol': symbol}).fetchone()
-                if row:
-                    return {
-                        'P': row[0], 'R1': row[1], 'R2': row[2], 'R3': row[3],
-                        'S1': row[4], 'S2': row[5], 'S3': row[6]
-                    }
+    def open_trade(self, plan: TradePlan, reference_price, fee_rate, slippage,
+                   timestamp=None, max_positions=3):
+        reference = decimal(reference_price)
+        fee_rate, slippage = decimal(fee_rate), decimal(slippage)
+        if plan.side not in ('LONG', 'SHORT') or reference <= ZERO or plan.margin <= ZERO:
+            raise ValueError('Invalid order.')
+        if not (1 <= plan.leverage <= 50 and ZERO < plan.sl_move < Decimal(1) / plan.leverage
+                and ZERO < plan.tp_move < 1):
+            raise ValueError('Invalid leverage or target/stop distance.')
+        if not (ZERO <= fee_rate < Decimal('.1') and ZERO <= slippage < Decimal('.1')):
+            raise ValueError('Invalid execution costs.')
+        sign = Decimal(1 if plan.side == 'LONG' else -1)
+        price = reference * (1 + sign * slippage)
+        quantity = plan.margin * plan.leverage / price
+        fee = plan.margin * plan.leverage * fee_rate
+        at = timestamp or utc_now()
+        with self.transaction() as c:
+            if c.execute("SELECT 1 FROM paper_trades WHERE symbol=? AND status IN ('OPEN','MOONBAG')", (plan.symbol,)).fetchone():
                 return None
-        except Exception as e:
-            # print(f"⚠️ Pivot Sorgu Hatası ({symbol}): {e}")
-            return None
+            count = c.execute("SELECT COUNT(*) FROM paper_trades WHERE status IN ('OPEN','MOONBAG')").fetchone()[0]
+            if count >= max_positions or decimal(c.execute('SELECT cash FROM paper_account WHERE id=1').fetchone()[0]) < plan.margin + fee:
+                return None
+            target = price * (1 + sign * plan.tp_move)
+            stop = price * (1 - sign * plan.sl_move)
+            cursor = c.execute('''INSERT INTO paper_trades
+                (symbol,side,entry_price,quantity,remaining,initial_margin,margin,leverage,
+                 stop,target,initial_target,pivot,tier,entry_time,signal_candle)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (plan.symbol, plan.side, str(price), str(quantity), str(quantity), str(plan.margin),
+                 str(plan.margin), plan.leverage, str(stop), str(target), str(target),
+                 str(plan.pivot) if plan.pivot is not None else None,
+                 'HIGH' if plan.score >= 80 or plan.score <= 20 else 'MEDIUM', at, plan.candle))
+            trade_id = cursor.lastrowid
+            self._add_cash(c, -plan.margin - fee)
+            c.execute('''INSERT INTO paper_fills
+                (trade_id,event_key,reason,price,quantity,gross_pnl,fee,net_pnl,timestamp)
+                VALUES(?,?,?,?,?,?,?,?,?)''',
+                (trade_id, f'{trade_id}:ENTRY', 'ENTRY', str(price), str(quantity), '0', str(fee), str(-fee), at))
+            return trade_id
 
-    # --- BAKIM VE TEMİZLİK ---
-    
-    def maintenance_clean_data(self, days=3):
-        """Eski verileri temizler (Açık işlem verileri hariç)."""
-        print(f"🧹 Veritabanı Bakımı Başlıyor... ({days} günden eski veriler taranıyor)")
-        
-        # PostgreSQL uyumlu NOW() - INTERVAL kullanımı
-        query = text(f"""
-            DELETE FROM market_data
-            WHERE timestamp < NOW() - INTERVAL '{days} days'
-            AND NOT EXISTS (
-                SELECT 1 FROM trade_history 
-                WHERE market_data.timestamp BETWEEN trade_history.entry_time AND COALESCE(trade_history.exit_time, NOW())
-            );
-        """)
+    def exit_trade(self, trade_id, reference_price, fee_rate, slippage, reason,
+                   fraction=Decimal(1), timestamp=None):
+        """Idempotent named exit; return margin + gross PnL - fee atomically."""
+        reference, fraction = decimal(reference_price), decimal(fraction)
+        fee_rate, slippage = decimal(fee_rate), decimal(slippage)
+        if reference <= ZERO or not ZERO < fraction <= 1 or not reason or reason == 'ENTRY':
+            raise ValueError('Invalid exit.')
+        if not (ZERO <= fee_rate < Decimal('.1') and ZERO <= slippage < Decimal('.1')):
+            raise ValueError('Invalid execution costs.')
+        at = timestamp or utc_now()
+        with self.transaction() as c:
+            row = c.execute('SELECT * FROM paper_trades WHERE id=?', (trade_id,)).fetchone()
+            if row is None or row['status'] not in ('OPEN', 'MOONBAG'):
+                return None
+            key = f'{trade_id}:{reason}'
+            if c.execute('SELECT 1 FROM paper_fills WHERE event_key=?', (key,)).fetchone():
+                return None
+            sign = Decimal(1 if row['side'] == 'LONG' else -1)
+            price = reference * (1 - sign * slippage)
+            remaining, margin = decimal(row['remaining']), decimal(row['margin'])
+            quantity = remaining * fraction
+            released = margin * fraction
+            gross = sign * (price - decimal(row['entry_price'])) * quantity
+            fee = price * quantity * fee_rate
+            # Approximate isolated margin: gaps cannot consume another trade's collateral.
+            gross = max(gross, -released + fee)
+            net = gross - fee
+            new_remaining, new_margin = remaining - quantity, margin - released
+            closed = fraction == 1
+            stop = row['entry_price'] if reason in ('TP1', 'PIVOT') else row['stop']
+            c.execute('''UPDATE paper_trades SET remaining=?,margin=?,stop=?,
+                tp1=CASE WHEN ?='TP1' THEN 1 ELSE tp1 END,
+                pivot_done=CASE WHEN ?='PIVOT' THEN 1 ELSE pivot_done END,
+                status=?,exit_time=? WHERE id=?''',
+                (str(new_remaining), str(new_margin), stop, reason, reason,
+                 ('LIQUIDATED' if reason == 'LIQUIDATION' else 'CLOSED') if closed else row['status'],
+                 at if closed else None, trade_id))
+            self._add_cash(c, released + net)
+            c.execute('''INSERT INTO paper_fills
+                (trade_id,event_key,reason,price,quantity,gross_pnl,fee,net_pnl,timestamp)
+                VALUES(?,?,?,?,?,?,?,?,?)''',
+                (trade_id, key, reason, str(price), str(quantity), str(gross), str(fee), str(net), at))
+            return Fill(trade_id, reason, price, quantity, gross, fee, net)
 
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(query)
-                conn.commit()
-                print(f"✨ Temizlik Tamamlandı! Silinen Satır Sayısı: {result.rowcount}")
-        except Exception as e:
-            # Tablo henüz yoksa hata vermesin, sessizce geçsin
-            print(f"⚠️ Bakım Bilgisi: Tablolar henüz boş veya oluşmadı ({e}).")
+    def recent_pnl(self, now=None, hours=24):
+        at = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        cutoff = (at - timedelta(hours=hours)).isoformat()
+        return sum((decimal(r['net_pnl']) for r in self._rows(
+            'SELECT net_pnl FROM paper_fills WHERE timestamp>=? AND timestamp<=?', (cutoff, at.isoformat()))), ZERO)
+
+    def summary(self, prices=None):
+        prices = prices or {}
+        cash, reserved, unrealized = self.cash(), ZERO, ZERO
+        active = self.active_trades()
+        for t in active:
+            margin = decimal(t['margin'])
+            reserved += margin
+            price = decimal(prices.get(t['symbol'], t['entry_price']))
+            sign = 1 if t['side'] == 'LONG' else -1
+            unrealized += max(sign * (price - decimal(t['entry_price'])) * decimal(t['remaining']), -margin)
+        fills = self.fills()
+        net = sum((decimal(f['net_pnl']) for f in fills), ZERO)
+        return {'cash': cash, 'reserved_margin': reserved, 'unrealized_pnl': unrealized,
+                'equity': cash + reserved + unrealized, 'realized_net_pnl': net,
+                'fees': sum((decimal(f['fee']) for f in fills), ZERO), 'active_positions': len(active)}
+
+    def close(self):
+        with self._lock:
+            self.conn.close()

@@ -1,88 +1,82 @@
-import ccxt
+"""Public market data only. This client has no authenticated order methods."""
+import asyncio
+from decimal import Decimal
+import time
+
+import aiohttp
 import pandas as pd
-from app.core import config  # Ayarlar dosyamızı çağırdık
+
+from app.analysis.strategy import validate_candles
+from app.core.models import decimal
+
+
+class MarketDataError(RuntimeError):
+    pass
 
 
 class BinanceClient:
-    def __init__(self):
-        """
-        Binance bağlantısını başlatan kurucu metod.
-        """
-        # Binance'e bağlanıyoruz (API Key olmadan public veri çekebiliriz)
-        self.exchange = ccxt.binance({
-            'enableRateLimit': True,  # Ban yememek için hız sınırı koyar
-        })
+    def __init__(self, settings):
+        self.settings = settings
+        self.session = None
+        self.clock_offset = 0
+        self.pause_until = 0
 
-    def get_ohlcv(self, symbol):
-        """
-        Belirtilen coin için Mum (OHLCV) verilerini çeker ve tabloya çevirir.
-        
-        Args:
-            symbol (str): Coin çifti (Örn: 'BTC/USDT')
-            
-        Returns:
-            pd.DataFrame: İşlenmiş veri tablosu
-        """
-        try:
-            # 1. Binance'den ham veriyi çek
-            # fetch_ohlcv fonksiyonu: Open, High, Low, Close, Volume getirir
-            bars = self.exchange.fetch_ohlcv(
-                symbol, 
-                timeframe=config.TIMEFRAME, 
-                limit=config.LIMIT
-            )
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+            total=self.settings.request_timeout), trust_env=True)
+        return self
 
-            # 2. Veriyi Pandas DataFrame'e (Tabloya) çevir [cite: 138]
-            # ccxt veriyi liste olarak verir, biz bunu Excel gibi sütunlara ayırıyoruz
-            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    async def __aexit__(self, *args):
+        await self.close()
 
-            # 3. Zaman damgasını (timestamp) okunabilir tarihe çevir
-            # Örn: 167890000 -> 2026-02-06 14:00:00
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    async def close(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
 
-            return df
+    async def _get(self, path, params=None):
+        if self.session is None:
+            raise RuntimeError('Use BinanceClient as an async context manager.')
+        if time.monotonic() < self.pause_until:
+            raise MarketDataError('Binance rate-limit cooldown active.')
+        for attempt in range(3):
+            try:
+                async with self.session.get(self.settings.api_base + path, params=params) as response:
+                    if response.status in (418, 429):
+                        # Do not retry into an exchange ban; the caller pauses trading.
+                        self.pause_until = time.monotonic() + max(60, float(response.headers.get('Retry-After', 60)))
+                        raise MarketDataError(f'Binance rate limit ({response.status}); retry later.')
+                    if response.status != 200:
+                        raise MarketDataError(f'Binance market data HTTP {response.status}.')
+                    return await response.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt == 2:
+                    raise MarketDataError('Binance public data unavailable (network/timeout).') from exc
+                await asyncio.sleep(2 ** attempt)
 
-        except Exception as e:
-            print(f"Hata oluştu ({symbol}): {e}")
-            return None
+    async def server_time(self):
+        payload = await self._get('/api/v3/time')
+        server = int(payload['serverTime'])
+        self.clock_offset = server - int(time.time() * 1000)
+        return server
 
-    def get_pivot_data(self, symbol):
-        """
-        Fibonacci Pivot Hesabı için Üst Zaman Diliminin (HTF)
-        Önceki mum verilerini (High, Low, Close) getirir.
-        """
-        # 1. Zaman Dilimi Eşleşmesi
-        htf = '1d' # Varsayılan: Günlük
-        
-        if config.TIMEFRAME in ['1m', '5m', '15m']:
-            htf = '1d' # Günlük Pivotlar
-        elif config.TIMEFRAME in ['1h', '4h']:
-            htf = '1w' # Haftalık Pivotlar
-        elif config.TIMEFRAME == '1d':
-            htf = '1M' # Aylık Pivotlar
-            
-        try:
-            # 2. HTF Verisini Çek (Sadece son 2 mum yeterli)
-            # Limit=2 alıyoruz çünkü [0] -> Tamamlanmamış mum, [1] -> Tamamlanmış (önceki) mum olabilir
-            # Ancak ccxt sıralaması eskiye -> yeniye doğru:
-            # [-1] -> Şu anki (canlı) mum
-            # [-2] -> Önceki kapanmış mum
-            
-            bars = self.exchange.fetch_ohlcv(symbol, timeframe=htf, limit=5)
-            if not bars or len(bars) < 2: return None
-            
-            # DataFrame'e çevir
-            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            # [-2] numaralı satırı (önceki kapanmış mum) al
-            prev_candle = df.iloc[-2]
-            
-            return {
-                'high': prev_candle['high'],
-                'low': prev_candle['low'],
-                'close': prev_candle['close']
-            }
-            
-        except Exception as e:
-            print(f"⚠️ Pivot Verisi Hatası ({symbol}): {e}")
-            return None
+    def now_ms(self):
+        return int(time.time() * 1000) + self.clock_offset
+
+    async def get_ohlcv(self, symbol, limit=1000):
+        payload = await self._get('/api/v3/klines', {
+            'symbol': symbol.replace('/', ''), 'interval': self.settings.timeframe, 'limit': limit})
+        now = await self.server_time()
+        rows = [{'timestamp': pd.to_datetime(r[0], unit='ms', utc=True),
+                 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5],
+                 'close_time': int(r[6])} for r in payload if int(r[6]) < now]
+        if not rows:
+            raise MarketDataError('No completed candles returned.')
+        return validate_candles(pd.DataFrame(rows))
+
+    async def get_current_price(self, symbol):
+        payload = await self._get('/api/v3/ticker/price', {'symbol': symbol.replace('/', '')})
+        price = decimal(payload['price'])
+        if price <= Decimal(0):
+            raise MarketDataError('Non-positive market price.')
+        return price

@@ -1,5 +1,7 @@
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -44,4 +46,21 @@ data/
 *.pbix
 *.log
 *.db
+
+# Original source copies and private local simulation outputs
+CryptoSentinel-3-Suanki/
+archive/
+.tmp/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.lock
+
+# Local credentials and certificates
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.json
+secrets.json
 

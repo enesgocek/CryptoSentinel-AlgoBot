@@ -1,68 +1,27 @@
-# telegram_bot.py
-import requests
-from app.core import config 
-import time  # Zaman takibi için gerekli
+"""Optional asynchronous notifications. Disabled unless explicitly configured."""
+import asyncio
+import logging
+import aiohttp
+
+log = logging.getLogger(__name__)
 
 
 class TelegramBot:
-    def __init__(self):
-        """
-        Botun kimlik, adres bilgileri ve Sinyal Hafızasını hazırlar.
-        """
-        self.token = config.TELEGRAM_TOKEN
-        self.chat_id = config.TELEGRAM_CHAT_ID
-        self.base_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        
-        # --- SPAM ENGELLEYİCİ AYARLARI ---
-        # Hangi coine en son ne zaman mesaj attık?
-        # Yapı: {'BTC/USDT': {'type': 'SHORT', 'time': 1708543210}}
-        self.last_signals = {} 
-        
-        # Aynı sinyal için kaç saniye sessiz kalalım? (300 sn = 5 Dakika)
-        self.cooldown_period = 300 
+    def __init__(self, settings):
+        self.settings = settings
 
-    def send_message(self, message, symbol=None, signal_type=None):
-        """
-        Belirtilen mesajı Telegram'a gönderir.
-        Eğer symbol ve signal_type verilirse SPAM kontrolü yapar.
-        """
-        # --- SPAM KONTROLÜ ---
-        if symbol and signal_type:
-            current_time = time.time()
-            
-            # Bu coin hafızada var mı?
-            if symbol in self.last_signals:
-                last_signal = self.last_signals[symbol]
-                
-                # Eğer sinyal TİPİ aynıysa (Yine SHORT ise) VE süre dolmamışsa
-                if last_signal['type'] == signal_type:
-                    time_passed = current_time - last_signal['time']
-                    
-                    if time_passed < self.cooldown_period:
-                        remaining = int(self.cooldown_period - time_passed)
-                        print(f"   🔕 {symbol} için '{signal_type}' bildirimi filtrelendi. ({remaining} sn kaldı)")
-                        return # Fonksiyondan çık, mesaj GÖNDERME.
-
-            # Hafızayı Güncelle (Yeni sinyali kaydet)
-            self.last_signals[symbol] = {
-                'type': signal_type,
-                'time': current_time
-            }
-
-        # --- GÖNDERME İŞLEMİ ---
+    async def send_message(self, message):
+        if not self.settings.telegram_enabled:
+            return False
         try:
-            payload = {
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "Markdown"
-            }
-            
-            response = requests.post(self.base_url, data=payload)
-            
-            if response.status_code == 200:
-                print("   ✅ Bildirim gönderildi.")
-            else:
-                print(f"   ⚠️ Bildirim hatası: {response.text}")
-                
-        except Exception as e:
-            print(f"   ❌ Bağlantı hatası: {e}")
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10), trust_env=True) as session:
+                async with session.post(
+                    f'https://api.telegram.org/bot{self.settings.telegram_token}/sendMessage',
+                    json={'chat_id': self.settings.telegram_chat_id, 'text': message}) as response:
+                    if response.status == 200:
+                        return True
+                    log.warning('Telegram notification failed (HTTP %s).', response.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            # Never log the request URL: it contains the secret token.
+            log.warning('Telegram notification unavailable.')
+        return False

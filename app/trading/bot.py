@@ -1,311 +1,161 @@
+"""Async live-data paper bot; every exchange interaction is public/read-only."""
+import asyncio
+from datetime import datetime, timezone
+import logging
 import time
+
 import pandas as pd
-import schedule
 
-from typing import Optional, Tuple, Dict, Any
-from datetime import datetime, timedelta
-
-from app.core import config
+from app.analysis.strategy import SentinelStrategy
 from app.core.database import DatabaseManager
-from app.services.binance_client import BinanceClient
+from app.services.binance_client import BinanceClient, MarketDataError
+from app.services.reporting import format_report
 from app.services.telegram_bot import TelegramBot
-from app.analysis.analyzer import MarketAnalyzer
+from app.trading.paper_engine import PaperEngine
 from app.trading.stream_manager import StreamManager
-from app.services.reporting import DailyReporter
+
+log = logging.getLogger(__name__)
+
 
 class CryptoSentinelBot:
-    """
-    Main trading bot class that orchestrates market analysis, signal detection,
-    and trade execution.
-    """
+    def __init__(self, settings, db=None):
+        self.settings = settings
+        self.db = db or DatabaseManager(settings.db_path, settings.initial_capital)
+        self.owns_db = db is None
+        self.strategy = SentinelStrategy(settings)
+        self.engine = PaperEngine(self.db, settings)
+        self.client = BinanceClient(settings)
+        self.notifier = TelegramBot(settings)
+        self.streamer = StreamManager(settings, self.client, self.on_price)
+        self.prices = {}
+        self.last_evaluated = {}
+        self.price_health = {}
+        self.notifications = asyncio.Queue(maxsize=200)
+        unexpected = {t['symbol'] for t in self.db.active_trades()} - set(settings.symbols)
+        if unexpected:
+            if self.owns_db:
+                self.db.close()
+            raise ValueError(f'Open positions are outside SYMBOLS: {sorted(unexpected)}. Restore those symbols.')
 
-    def __init__(self):
-        """Bot için gerekli modülleri başlatır."""
-        print("🚀 Crypto Sentinel: HİBRİT TRADER MODU (Dynamic ROE Logic) v8.2 (Fix)...\n")
-        
-        # Modülleri başlat
-        self.client = BinanceClient()
-        self.analyzer = MarketAnalyzer()
-        self.bot = TelegramBot()
-        self.db_manager = DatabaseManager()
-        self.streamer = StreamManager()
-        self.reporter = DailyReporter() # Raporcu Başlatıldı
-
-    def start_services(self) -> None:
-        """Arka plan servislerini (WebSocket) başlatır ve veritabanı temizliği yapar."""
-        print("📡 Servisler başlatılıyor...")
-        
-        # Start WebSocket Stream
-        self.streamer.start()
-        
-        # Initial Database Maintenance
-        self.db_manager.maintenance_clean_data(days=3)
-        
-        # Cüzdan Bakiyesini Getir
-        balance = 0
-        try:
-            balance = self.db_manager.get_balance()
-        except:
-            balance = config.INITIAL_CAPITAL
-
-        # Send Startup Message
-        startup_msg = (
-            f"🚀 SİSTEM AKTİF!\n"
-            f"------------------\n"
-            f"💰 Kasa: {balance:.2f} $\n"
-            f"📡 Mod: Hybrid (WebSocket)\n"
-            f"⚡ Kaldıraç: {config.LEVERAGE}x\n"
-            f"🎯 Baz Hedef ROE: %{config.TARGET_ROE_TP*100}\n"
-            f"🛑 Baz Risk ROE: %{config.TARGET_ROE_SL*100}"
-        )
-        try:
-            self.bot.send_message(startup_msg)
-        except Exception as e:
-            print(f"⚠️ Telegram Başlangıç Mesajı Hatası: {e}")
-
-    def process_coin(self, coin: str, open_trades: pd.DataFrame) -> None:
-        """Tek bir coini analiz eder ve işlem fırsatlarını değerlendirir."""
-        df = self.client.get_ohlcv(coin)
-        
-        if df is None:
-            return
-
-        # 1. Technical Analysis
-        # Yeni: Multi-Timeframe Pivot Verisini Çek
-        pivot_data = self.client.get_pivot_data(coin)
-        
-        # Pivot verisini analyzer'a gönder
-        df = self.analyzer.calculate_indicators(df, pivot_data=pivot_data)
-        
-        _, current_score = self.analyzer.check_signals(df, coin)
-
-        # 2. Piyasa Rejimi ve Volatilite Kontrolü
-        last_row = df.iloc[-1]
-        
-        vol_result = self.analyzer.get_volatility_multiplier(df)        
-        
-        if isinstance(vol_result, tuple):
-            volatility_multiplier, regime_name = vol_result
-        else:
-            volatility_multiplier = vol_result
-            if volatility_multiplier < 1.0: regime_name = "SQUEEZE (Sıkışma)"
-            elif volatility_multiplier > 1.0: regime_name = "VOLATILE (Hareketli)"
-            else: regime_name = "NORMAL (Trend)"
-
-        # 3. Piyasa Verilerini Kaydet
-        df['symbol'] = coin
-        df['sentinel_score'] = df.apply(lambda row: self.analyzer.calculate_sentinel_score(row), axis=1)
-        self.db_manager.save_to_db(df.tail(1), 'market_data')
-
-        last_price = last_row['close']
-        
-        # 4. Açık İşlem Kontrolü
-        active_trade = open_trades[open_trades['symbol'] == coin] if not open_trades.empty else pd.DataFrame()
-
-        if not active_trade.empty:
-            trade_data = active_trade.iloc[0]
-            print(f" 🛡️ {coin} Korunuyor... (Giriş: {trade_data['entry_price']})")
-        else:
-            # --- CIRCUIT BREAKER KONTROLÜ ---
-            if self._check_circuit_breaker(current_score):
-                print(f" ❄️ Circuit Breaker Aktif (İşlem Engellendi) - {coin}")
-            else:
-                self._evaluate_new_trade(coin, last_price, current_score, regime_name, volatility_multiplier)
-
-    def _check_circuit_breaker(self, current_score: float) -> bool:
-        """
-        Akıllı Şalter Kontrolü:
-        Günlük limitler aşıldıysa ve soğuma süresi bitmediyse TRUE döner (İşlem Engellenir).
-        High Confidence (80-20) durumunda limitler esnetilir.
-        """
-        # 1. Güncel PnL Durumunu Çek (Son 24 Saat)
-        recent_pnl = self.db_manager.get_recent_pnl(hours=24)
-        
-        # 2. Limitleri Belirle
-        target_profit = config.DAILY_TARGET_PROFIT
-        max_loss = config.DAILY_MAX_LOSS
-        
-        # Eğer çok güçlü bir sinyal varsa limitleri esnet
-        if current_score >= 80 or current_score <= 20:
-            target_profit = config.EXTENDED_TARGET_PROFIT
-            max_loss = config.EXTENDED_MAX_LOSS
-
-        # 3. Limit Kontrolü
-        # Kar hedefi aşıldıysa VEYA Zarar limiti delindiyse (max_loss negatiftir, örn: -50)
-        is_limit_hit = (recent_pnl >= target_profit) or (recent_pnl <= max_loss)
-        
-        if not is_limit_hit:
-            return False # Sorun yok, işlem açılabilir
-            
-        # 4. Limit Aşıldıysa Soğuma Süresine Bak
-        last_exit = self.db_manager.get_last_trade_exit_time()
-        
-        if not last_exit:
-            return False # Hiç işlem yoksa devam
-            
-        # last_exit bir string gelebilir, datetime objesine çevir
-        if isinstance(last_exit, str):
-            last_exit = datetime.strptime(last_exit, "%Y-%m-%d %H:%M:%S.%f") # Format değişebilir, dikkat
-
-        time_since_exit = datetime.now() - last_exit
-        cooldown_delta = timedelta(hours=config.TRADING_COOLDOWN_HOURS)
-        
-        if time_since_exit < cooldown_delta:
-            remaining = cooldown_delta - time_since_exit
-            hours, remainder = divmod(remaining.seconds, 3600)
-            mins, _ = divmod(remainder, 60)
-            
-            # Logu her saniye basmamak için burayı sessiz geçebiliriz veya özel bir log condition ekleriz.
-            # Şimdilik process_coin içinde tek satır basıyoruz.
-            return True # ENGELLE
-            
-        return False # Süre dolmuş, tekrar izin ver
-
-    def _evaluate_new_trade(self, coin: str, last_price: float, current_score: float, regime_name: str, volatility_multiplier: float) -> None:
-        """Puan ve rejime göre yeni işlem açılışını, pozisyon büyüklüğünü ve bakiyeyi değerlendirir."""
-        # last_price'ı entry_price olarak tanımlıyoruz
-        entry_price = last_price 
-
-        # --- 0. TEKRAR İŞLEM KONTROLÜ ---
-        fresh_open_trades = self.db_manager.get_open_trades()
-        if not fresh_open_trades.empty and coin in fresh_open_trades['symbol'].values:
-            return
-
-        # --- 1. POZİSYON BÜYÜKLÜĞÜ (RİSK YÖNETİMİ) ---
-        position_size = 0.0
-        confidence = "DÜŞÜK"
-
-        # Config'den değerleri al
-        # RISK_VARS kullanılır
-        high_size = config.RISK_VARS.get('HIGH', 100.0)
-        med_size = config.RISK_VARS.get('MEDIUM', 50.0)
-        low_size = config.RISK_VARS.get('LOW', 25.0)
-
-        if current_score >= 80 or current_score <= 20:
-            position_size = high_size
-            confidence = "YÜKSEK"
-        elif (current_score >= 60 and current_score < 80) or (current_score > 20 and current_score <= 40):
-            position_size = med_size
-            confidence = "ORTA"
-        else:
-            position_size = low_size
-            confidence = "DÜŞÜK"
-
-
-        # --- 2. BAKİYE KONTROLÜ (SANAL CÜZDAN) ---
-        # Veritabanından bakiye sorgula
-        try:
-            current_balance = self.db_manager.get_balance()
-        except:
-            current_balance = 0.0
-
-        if current_balance < position_size:
-            # print(f"⚠️ Yetersiz Bakiye! ({coin} için {position_size}$ gerekiyor, Mevcut: {current_balance:.2f}$)")
-            return
-
-        # --- 3. DİNAMİK HEDEF HESAPLAMA ---
-        dynamic_tp_roe = config.TARGET_ROE_TP * volatility_multiplier
-        dynamic_sl_roe = config.TARGET_ROE_SL * volatility_multiplier
-        
-        required_move_tp = dynamic_tp_roe / config.LEVERAGE 
-        required_move_sl = dynamic_sl_roe / config.LEVERAGE 
-
-        liq_price = 0.0
-        tp_price = 0.0
-        sl_price = 0.0
-        target_position = None
-        
-        # --- 4. SİNYAL YÖNÜ BELİRLEME ---
-        if current_score >= 60:
-            target_position = "LONG"
-            liq_price = entry_price * (1 - (1 / config.LEVERAGE))
-            tp_price = entry_price * (1 + required_move_tp)
-            sl_price = entry_price * (1 - required_move_sl)
-
-        elif current_score <= 40:
-            target_position = "SHORT"
-            liq_price = entry_price * (1 + (1 / config.LEVERAGE))
-            tp_price = entry_price * (1 - required_move_tp)
-            sl_price = entry_price * (1 + required_move_sl)
-
-        # İşlem Mantığı (Transactional)
-        if target_position:
-            # 1. Veritabanına Yaz
-            success = self.db_manager.open_trade(
-                coin, target_position, entry_price, liq_price, tp_price, sl_price, position_size, timeframe=config.TIMEFRAME
-            )
-            
-            # 2. Başarılıysa Bildirim Gönder
-            if success:
-                safe_regime_name = str(regime_name).replace("_", " ").replace("*", "")
-
-                print("-" * 30)
-                print(f"🌪️ REGIME: {safe_regime_name} (Çarpan: {volatility_multiplier}x)")
-                print(f"💰 CÜZDAN: {current_balance:.2f}$ | RİSK: {position_size}$ ({confidence})")
-                print(f"🚀 SİNYAL: {target_position} ({current_score} Puan)")
-                print(f"✅ İŞLEM BAŞARIYLA AÇILDI: {coin}")
-                
-                icon = "🐂" if target_position == "LONG" else "🐻"
-                msg = (
-                    f"🚀 YENİ İŞLEM AÇILDI {icon}\n"
-                    f"--------------------------------\n"
-                    f"💎 Coin: {coin}\n"
-                    f"⚖️ Yön: {target_position}\n"
-                    f"🌪️ Rejim: {safe_regime_name}\n"
-                    f"📊 Güven: {confidence} ({current_score})\n"
-                    f"💰 Büyüklük: {position_size} $\n"
-                    f"💵 Giriş: {entry_price:.2f} $\n"
-                    f"--------------------------------\n"
-                    f"🎯 Hedef (TP): {tp_price:.2f} $\n"
-                    f"🛑 Stop (SL): {sl_price:.2f} $\n"
-                    f"⚡ Kaldıraç: {config.LEVERAGE}x\n"
-                    f"🏦 Kalan Bakiye: {current_balance - position_size:.2f} $\n"
-                    f"--------------------------------"
-                )
+    async def on_price(self, symbol, price):
+        self.prices[symbol] = price
+        self.price_health[symbol] = time.monotonic()
+        fills = self.engine.on_price(symbol, price)
+        for fill in fills:
+            log.info('%s %s | net PnL %+.4f USDT', symbol, fill.reason, fill.net_pnl)
+            if self.settings.telegram_enabled:
                 try:
-                    self.bot.send_message(msg)
-                except Exception as e:
-                    print(f"⚠️ Mesaj Gönderilemedi: {e}")
-            else:
-                pass
+                    self.notifications.put_nowait(f'SANAL {symbol} #{fill.trade_id}: {fill.reason}; net PnL {fill.net_pnl:+.4f} USDT')
+                except asyncio.QueueFull:
+                    log.warning('Notification queue full; fill remains safely stored in the ledger.')
+        return fills
 
-        else:
-            print(f" 💤 {coin} İzleniyor... (Puan: {current_score})")
+    async def notification_loop(self):
+        while True:
+            message = await self.notifications.get()
+            try:
+                await self.notifier.send_message(message)
+            finally:
+                self.notifications.task_done()
 
-    def stop(self) -> None:
-        """Stops all running services."""
-        if hasattr(self, 'streamer') and self.streamer:
-            self.streamer.keep_running = False
-            if self.streamer.ws:
-                self.streamer.ws.close()
-        print("🛑 Bot ve servisler başarıyla durduruldu.")
-
-    def run(self) -> None:
-        """Main execution loop."""
-        self.start_services()
-        
-        # Zamanlayıcıyı Kur
-        self.reporter.run_scheduler()
-        
+    async def check_stream(self):
+        task = asyncio.create_task(self.streamer.run())
         try:
-            while True:
-                # 1. Zamanlanmış Görevleri Kontrol Et
-                schedule.run_pending()
-                
-                open_trades = self.db_manager.get_open_trades()
-
-                for coin in config.SYMBOLS:
-                    self.process_coin(coin, open_trades)
-                    print("-" * 30)
-                    time.sleep(1) 
-
-                print("⏳ Analiz turu bitti. 10 sn bekleme...")
-                time.sleep(10) 
-                
-        except KeyboardInterrupt:
-            print("\n🛑 Döngü kırıldı.")
-        except Exception as e:
-            print(f"⚠️ Kritik Hata: {e}")
-            time.sleep(5)
+            async def wait_for_symbols():
+                while not all(self.streamer.fresh(s) for s in self.settings.symbols):
+                    await asyncio.sleep(.1)
+            await asyncio.wait_for(wait_for_symbols(), timeout=15)
+            log.info('WebSocket verified: fresh trade events received for all %s symbols.', len(self.settings.symbols))
+            return True
+        except asyncio.TimeoutError:
+            log.warning('WebSocket check timed out; public REST data passed and remains the fallback.')
+            return False
         finally:
-            self.stop()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def analyze_once(self, trade=True):
+        successes = 0
+        for symbol in self.settings.symbols:
+            try:
+                frame = await self.client.get_ohlcv(symbol)
+                # A successful HTTP response with old candles is not a healthy feed.
+                interval = pd.Timedelta(self.settings.timeframe)
+                latest = pd.Timestamp(frame.iloc[-1]['timestamp'])
+                now = pd.to_datetime(self.client.now_ms(), unit='ms', utc=True)
+                if now - latest > interval * 2 + pd.Timedelta(seconds=self.settings.stale_seconds):
+                    raise MarketDataError('Candle feed is stale; new entries suspended.')
+                price = await self.client.get_current_price(symbol)
+                await self.on_price(symbol, price)
+                successes += 1
+                candle_key = latest.isoformat()
+                if self.last_evaluated.get(symbol) == candle_key:
+                    continue
+                evaluation = await asyncio.to_thread(self.strategy.evaluate, frame, symbol)
+                if evaluation:
+                    self.last_evaluated[symbol] = candle_key
+                    log.info('%s | closed candle %s | score %s | price %s', symbol,
+                             evaluation.candle, evaluation.score, price)
+                    if trade:
+                        if time.monotonic() - self.price_health.get(symbol, float('-inf')) >= self.settings.stale_seconds:
+                            log.warning('%s: quote expired during analysis; entry skipped.', symbol)
+                            continue
+                        trade_id = self.engine.submit(evaluation, price)
+                        if trade_id:
+                            log.info('PAPER position #%s opened: %s %s', trade_id, symbol, evaluation.plan.side)
+                            await self.notifier.send_message(f'SANAL ISLEM #{trade_id}: {symbol} {evaluation.plan.side}')
+            except (MarketDataError, ValueError, KeyError, TypeError) as exc:
+                log.warning('%s: %s', symbol, exc)
+        return successes
+
+    async def monitor_prices(self):
+        while True:
+            for symbol in self.settings.symbols:
+                if self.streamer.fresh(symbol):
+                    continue
+                try:
+                    await self.on_price(symbol, await self.client.get_current_price(symbol))
+                except MarketDataError:
+                    if time.monotonic() - self.price_health.get(symbol, float('-inf')) > self.settings.stale_seconds:
+                        log.warning('%s: no fresh prices; no new orders will use cached prices.', symbol)
+            await asyncio.sleep(self.settings.price_poll_seconds)
+
+    async def market_loop(self):
+        while True:
+            await self.analyze_once()
+            await asyncio.sleep(self.settings.poll_seconds)
+
+    async def report_loop(self):
+        last_day = None
+        while True:
+            day = datetime.now(timezone.utc).date()
+            if day != last_day:
+                report = format_report(self.db, self.prices)
+                log.info('\n%s', report)
+                await self.notifier.send_message(report)
+                last_day = day
+            await asyncio.sleep(30)
+
+    async def run(self, once=False, check=False):
+        try:
+            async with self.client:
+                log.info('PAPER mode | public Binance prices | local database: %s', self.db.path)
+                ok = await self.analyze_once(trade=not check)
+                if once or check:
+                    if ok != len(self.settings.symbols):
+                        raise MarketDataError('Not all symbols passed the live-data check.')
+                    if check:
+                        await self.check_stream()
+                    return format_report(self.db, self.prices)
+                tasks = [asyncio.create_task(coro) for coro in (
+                    self.streamer.run(), self.monitor_prices(), self.market_loop(),
+                    self.report_loop(), self.notification_loop())]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if self.owns_db:
+                self.db.close()
